@@ -62,12 +62,14 @@
 #include "nrf_sdh_ble.h"
 #include "nrf_ble_gatt.h"
 #include "nrf_ble_qwr.h"
+#include "app_fifo.h"
 #include "app_timer.h"
 #include "ble_nus.h"
 #include "app_uart.h"
 #include "app_util_platform.h"
 #include "bsp_btn_ble.h"
 #include "nrf_pwr_mgmt.h"
+#include "nrf_delay.h"
 
 #if defined (UART_PRESENT)
 #include "nrf_uart.h"
@@ -117,6 +119,9 @@ static ble_uuid_t m_adv_uuids[]          =                                      
     {BLE_UUID_NUS_SERVICE, NUS_SERVICE_UUID_TYPE}
 };
 
+static volatile bool run_dummy_test = false;
+static volatile bool ble_buffers_available = true;
+static volatile bool retransmit_previous_buffer = false;
 
 /**@brief Function for assert macro callback.
  *
@@ -219,6 +224,9 @@ static void nus_data_handler(ble_nus_evt_t * p_evt)
         {
             while (app_uart_put('\n') == NRF_ERROR_BUSY);
         }
+
+        // When any data is received from the Bluetooth client, start a dummy data transfer test
+        run_dummy_test = true;
     }
 
 }
@@ -411,6 +419,14 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
             err_code = sd_ble_gap_disconnect(p_ble_evt->evt.gatts_evt.conn_handle,
                                              BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
             APP_ERROR_CHECK(err_code);
+            break;
+
+        case BLE_GATTS_EVT_HVN_TX_COMPLETE:
+            if(!ble_buffers_available) 
+            {
+                ble_buffers_available = true;
+                retransmit_previous_buffer = true;
+            }
             break;
 
         default:
@@ -721,16 +737,78 @@ static void advertising_start(void)
     APP_ERROR_CHECK(err_code);
 }
 
+// Create a FIFO structure
+app_fifo_t dummy_fifo;
+
+uint32_t dummy_fifo_bytes_used;
+
+// Create a buffer for the FIFO
+#define DUMMY_FIFO_SIZE 512
+uint8_t dummy_buffer[DUMMY_FIFO_SIZE];
+
+static int dummy_buffer_write(uint8_t *data, uint32_t len)
+{
+    app_fifo_write(&dummy_fifo, data, &len);
+    dummy_fifo_bytes_used += len;
+    return len;
+}
+
+static int dummy_buffer_bytes_free(void)
+{
+    return DUMMY_FIFO_SIZE - dummy_fifo_bytes_used;
+}
+
+static int dummy_buffer_read(uint8_t *data, uint32_t len)
+{
+    app_fifo_read(&dummy_fifo, data, &len);
+    dummy_fifo_bytes_used -= len;
+    return len;
+}
+
+static int dummy_buffer_bytes_used(void)
+{
+    return dummy_fifo_bytes_used;
+}
+
+static void init_dummy_buffer(void)
+{
+    // Initialize FIFO structure
+    uint32_t err_code = app_fifo_init(&dummy_fifo, dummy_buffer, DUMMY_FIFO_SIZE);
+    APP_ERROR_CHECK(err_code);
+
+    dummy_fifo_bytes_used = 0;
+}
+
+static void simulated_dummy_data_read(uint8_t *data, uint32_t len)
+{
+    static uint8_t data_counter = 'a';
+    for(int i = 0; i < len; i++)
+    {
+        data[i] = data_counter++;
+        if(data_counter > 'z') data_counter = 'a';
+    }
+
+    // Simulate that the read operation takes some time to complete, by adding a blocking delay
+    //nrf_delay_ms(2);
+}
+
+#define TEST_DUMP_SIZE 4096
+#define TEST_READ_SIZE 128
+#define TEST_WRITE_SIZE 20//m_ble_nus_max_data_len
+uint32_t dummy_test_remaining_bytes_read = 0;
+uint32_t dummy_test_remaining_bytes_write = 0;
 
 /**@brief Application main function.
  */
 int main(void)
 {
     bool erase_bonds;
+    uint32_t err_code;
 
     // Initialize.
     uart_init();
     log_init();
+    nrf_gpio_cfg_output(LED_1);
     timers_init();
     buttons_leds_init(&erase_bonds);
     power_management_init();
@@ -741,14 +819,75 @@ int main(void)
     advertising_init();
     conn_params_init();
 
+    init_dummy_buffer();
+
     // Start execution.
     printf("\r\nUART started.\r\n");
     NRF_LOG_INFO("Debug logging for UART over RTT started.");
     advertising_start();
 
+    static uint8_t tmp_read_buffer[TEST_READ_SIZE];
+    static uint8_t tmp_write_buffer[244];
+    uint16_t write_length;
+    int bt_written;
+
     // Enter main loop.
     for (;;)
     {
+        // If the run_dummy_test flag is set, start a new data dump test
+        if(run_dummy_test) 
+        {
+            run_dummy_test = false;
+            bt_written = 0;
+            dummy_test_remaining_bytes_read = TEST_DUMP_SIZE;
+        }
+
+        // As long as there are bytes left to read, and there is room in the dummy buffer, read out a single packet
+        if(dummy_test_remaining_bytes_read && dummy_buffer_bytes_free() >= TEST_READ_SIZE)
+        {
+            uint32_t read_length = (dummy_test_remaining_bytes_read > TEST_READ_SIZE) ? TEST_READ_SIZE : dummy_test_remaining_bytes_read;
+            simulated_dummy_data_read(tmp_read_buffer, read_length);
+            dummy_buffer_write(tmp_read_buffer, read_length);
+            dummy_test_remaining_bytes_read -= read_length;
+            //NRF_LOG_INFO("Dummy data produced %i, remaining %i", read_length, dummy_test_remaining_bytes_read);
+        }
+
+        // As long as there is data in the dummy buffer, and the Bluetooth stack has free buffers, upload a packet
+        if(ble_buffers_available && (dummy_buffer_bytes_used() > 0 || retransmit_previous_buffer))
+        {
+            nrf_gpio_pin_clear(LED_1);
+            if(!retransmit_previous_buffer)
+            {
+                write_length = dummy_buffer_read(tmp_write_buffer, TEST_WRITE_SIZE);
+                //NRF_LOG_INFO(" Fifo to tmp %i bytes", write_length);
+            } 
+
+            // 
+            err_code = ble_nus_data_send(&m_nus, tmp_write_buffer, &write_length, m_conn_handle);
+            if(err_code == NRF_SUCCESS)
+            {
+                bt_written += write_length;
+                //NRF_LOG_INFO("   Tmp to BT total: %i (+%i)", bt_written, write_length);
+            }
+            else if(err_code == NRF_ERROR_RESOURCES) 
+            {
+                ble_buffers_available = false;
+                nrf_gpio_pin_set(LED_1);
+                //NRF_LOG_INFO("     ERROR RESOURCES");
+            }
+            else if(err_code != NRF_ERROR_INVALID_STATE && err_code != NRF_ERROR_NOT_FOUND)
+            {
+                APP_ERROR_CHECK(err_code);
+            }
+
+            retransmit_previous_buffer = false;
+
+            if(bt_written == TEST_DUMP_SIZE) 
+            {
+                NRF_LOG_INFO("Test complete!");
+            }
+        }
+
         idle_state_handle();
     }
 }
