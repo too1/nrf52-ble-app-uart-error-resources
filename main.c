@@ -422,6 +422,8 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
             break;
 
         case BLE_GATTS_EVT_HVN_TX_COMPLETE:
+            // In case the ble_buffers_available flag is cleared, set it again, and set the retransmit_previous_buffer flag to ensure that 
+            // the packet that caused the NRF_ERROR_RESOURCES error to be returned will get sent successfully before new data is written
             if(!ble_buffers_available) 
             {
                 ble_buffers_available = true;
@@ -789,7 +791,7 @@ static void simulated_dummy_data_read(uint8_t *data, uint32_t len)
     }
 
     // Simulate that the read operation takes some time to complete, by adding a blocking delay
-    //nrf_delay_ms(2);
+    nrf_delay_ms(1);
 }
 
 #define TEST_DUMP_SIZE 4096
@@ -808,7 +810,6 @@ int main(void)
     // Initialize.
     uart_init();
     log_init();
-    nrf_gpio_cfg_output(LED_1);
     timers_init();
     buttons_leds_init(&erase_bonds);
     power_management_init();
@@ -822,7 +823,7 @@ int main(void)
     init_dummy_buffer();
 
     // Start execution.
-    printf("\r\nUART started.\r\n");
+    printf("\r\NRF_ERROR_RESOURCES test started.\r\n");
     NRF_LOG_INFO("Debug logging for UART over RTT started.");
     advertising_start();
 
@@ -845,45 +846,71 @@ int main(void)
         // As long as there are bytes left to read, and there is room in the dummy buffer, read out a single packet
         if(dummy_test_remaining_bytes_read && dummy_buffer_bytes_free() >= TEST_READ_SIZE)
         {
+            // Set the read_length to the minimum of the remaining bytes to read and the test read size
             uint32_t read_length = (dummy_test_remaining_bytes_read > TEST_READ_SIZE) ? TEST_READ_SIZE : dummy_test_remaining_bytes_read;
+            
+            // Read simulated sensor data into a temporary array
             simulated_dummy_data_read(tmp_read_buffer, read_length);
+            
+            // Move the sensor data from the temporary array into our FIFO buffer
             dummy_buffer_write(tmp_read_buffer, read_length);
+
+            // Reduce the remaining number of bytes to read for the test
             dummy_test_remaining_bytes_read -= read_length;
-            //NRF_LOG_INFO("Dummy data produced %i, remaining %i", read_length, dummy_test_remaining_bytes_read);
+
+            NRF_LOG_DEBUG("Dummy data produced %i, remaining %i", read_length, dummy_test_remaining_bytes_read);
         }
 
-        // As long as there is data in the dummy buffer, and the Bluetooth stack has free buffers, upload a packet
+        // As long as there is data in the dummy buffer, and the Bluetooth stack has free buffers, upload a packet to the Bluetooth stack
+        // If retransmit_previous_buffer is set it means the packet stored in tmp_write_buffer still hasn't been successfully
+        // sent (because of NRF_ERROR_RESOURCES). In this case we try to send it again, without reading new data from the FIFO
         if(ble_buffers_available && (dummy_buffer_bytes_used() > 0 || retransmit_previous_buffer))
         {
-            nrf_gpio_pin_clear(LED_1);
+            bsp_board_led_off(0);
+
+            // Read new data from the FIFO unless retransmit_previous_buffer is set, in which case we have to retransmit the last packet
             if(!retransmit_previous_buffer)
             {
+                // Move a new packet from the FIFO to the temporary write buffer
                 write_length = dummy_buffer_read(tmp_write_buffer, TEST_WRITE_SIZE);
-                //NRF_LOG_INFO(" Fifo to tmp %i bytes", write_length);
+
+                NRF_LOG_DEBUG(" Fifo to tmp %i bytes", write_length);
             } 
 
-            // 
+            // Forward a single packet to the Bluetooth stack
+            // NOTE: This code assumes that write_length will not be changed by ble_nus_data_send(..) (this could happen if you try to send a packet
+            //       longer than the negotiated MTU size). If this could happen then the code needs to be changed to ensure that the remaining data gets
+            //       written afterwards. 
             err_code = ble_nus_data_send(&m_nus, tmp_write_buffer, &write_length, m_conn_handle);
             if(err_code == NRF_SUCCESS)
             {
+                // In case of success, update the bt_written parameter (please note the data will still take some time to reach the Bluetooth client)
                 bt_written += write_length;
-                //NRF_LOG_INFO("   Tmp to BT total: %i (+%i)", bt_written, write_length);
+
+                NRF_LOG_DEBUG("   Tmp to BT total: %i (+%i)", bt_written, write_length);
             }
             else if(err_code == NRF_ERROR_RESOURCES) 
             {
+                // In case of NRF_ERROR_RESOURCES, clear the ble_buffers_available flag to avoid trying to send more data until the Bluetooth buffers
+                // clear up. This flag will be cleared by the BLE_GATTS_EVT_HVN_TX_COMPLETE event in the ble_evt_handler function in main.c
                 ble_buffers_available = false;
-                nrf_gpio_pin_set(LED_1);
-                //NRF_LOG_INFO("     ERROR RESOURCES");
+
+                bsp_board_led_on(0);
+
+                NRF_LOG_DEBUG("     ERROR RESOURCES");
             }
             else if(err_code != NRF_ERROR_INVALID_STATE && err_code != NRF_ERROR_NOT_FOUND)
             {
                 APP_ERROR_CHECK(err_code);
             }
-
+            
+            // The retransmit_previous_buffer should be cleared for any upload. 
+            // If NRF_ERROR_RESOURCES were to happen again it should be set again in the ble_evt_handler
             retransmit_previous_buffer = false;
 
             if(bt_written == TEST_DUMP_SIZE) 
             {
+                // Any other code that should be added upon completion can be added here. 
                 NRF_LOG_INFO("Test complete!");
             }
         }
