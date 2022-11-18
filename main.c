@@ -745,7 +745,7 @@ app_fifo_t dummy_fifo;
 uint32_t dummy_fifo_bytes_used;
 
 // Create a buffer for the FIFO
-#define DUMMY_FIFO_SIZE 512
+#define DUMMY_FIFO_SIZE 1024
 uint8_t dummy_buffer[DUMMY_FIFO_SIZE];
 
 static int dummy_buffer_write(uint8_t *data, uint32_t len)
@@ -794,11 +794,10 @@ static void simulated_dummy_data_read(uint8_t *data, uint32_t len)
     nrf_delay_ms(1);
 }
 
-#define TEST_DUMP_SIZE 4096
+#define TEST_DUMP_SIZE 10000
 #define TEST_READ_SIZE 128
-#define TEST_WRITE_SIZE 20//m_ble_nus_max_data_len
+#define TEST_WRITE_SIZE 244//m_ble_nus_max_data_len
 uint32_t dummy_test_remaining_bytes_read = 0;
-uint32_t dummy_test_remaining_bytes_write = 0;
 
 /**@brief Application main function.
  */
@@ -823,14 +822,16 @@ int main(void)
     init_dummy_buffer();
 
     // Start execution.
-    printf("\r\NRF_ERROR_RESOURCES test started.\r\n");
-    NRF_LOG_INFO("Debug logging for UART over RTT started.");
+    NRF_LOG_INFO("NRF_ERROR_RESOURCES test application started.");
+
     advertising_start();
 
     static uint8_t tmp_read_buffer[TEST_READ_SIZE];
     static uint8_t tmp_write_buffer[244];
     uint16_t write_length;
     int bt_written;
+
+    uint32_t timestamp_test_start, timestamp_test_stop;
 
     // Enter main loop.
     for (;;)
@@ -841,6 +842,7 @@ int main(void)
             run_dummy_test = false;
             bt_written = 0;
             dummy_test_remaining_bytes_read = TEST_DUMP_SIZE;
+            timestamp_test_start = app_timer_cnt_get();
         }
 
         // As long as there are bytes left to read, and there is room in the dummy buffer, read out a single packet
@@ -864,7 +866,9 @@ int main(void)
         // As long as there is data in the dummy buffer, and the Bluetooth stack has free buffers, upload a packet to the Bluetooth stack
         // If retransmit_previous_buffer is set it means the packet stored in tmp_write_buffer still hasn't been successfully
         // sent (because of NRF_ERROR_RESOURCES). In this case we try to send it again, without reading new data from the FIFO
-        if(ble_buffers_available && (dummy_buffer_bytes_used() > 0 || retransmit_previous_buffer))
+        // In case there is nothing more to read we don't require the dummy buffer to contain at least TEST_WRITE_SIZE bytes, in order to send the remaining bytes
+        if(ble_buffers_available && (dummy_buffer_bytes_used() >= TEST_WRITE_SIZE || retransmit_previous_buffer || \
+                                    (dummy_buffer_bytes_used() > 0 && dummy_test_remaining_bytes_read == 0)))
         {
             bsp_board_led_off(0);
 
@@ -886,8 +890,11 @@ int main(void)
             {
                 // In case of success, update the bt_written parameter (please note the data will still take some time to reach the Bluetooth client)
                 bt_written += write_length;
+                
+                // The retransmit_previous_buffer should be cleared for any successful upload. 
+                retransmit_previous_buffer = false;
 
-                NRF_LOG_DEBUG("   Tmp to BT total: %i (+%i)", bt_written, write_length);
+                NRF_LOG_DEBUG("   Tmp to BT total: %i (+%i), buf used %i", bt_written, write_length, dummy_buffer_bytes_used());
             }
             else if(err_code == NRF_ERROR_RESOURCES) 
             {
@@ -904,18 +911,21 @@ int main(void)
                 APP_ERROR_CHECK(err_code);
             }
             
-            // The retransmit_previous_buffer should be cleared for any upload. 
-            // If NRF_ERROR_RESOURCES were to happen again it should be set again in the ble_evt_handler
-            retransmit_previous_buffer = false;
-
             if(bt_written == TEST_DUMP_SIZE) 
             {
+                timestamp_test_stop = app_timer_cnt_get();
+                uint32_t diff = app_timer_cnt_diff_compute(timestamp_test_stop, timestamp_test_start);
+                uint32_t kbps = (uint32_t)((float)(TEST_DUMP_SIZE * 8) / ((float)diff / 16384.0f) / 1024.0f);
                 // Any other code that should be added upon completion can be added here. 
-                NRF_LOG_INFO("Test complete!");
+                NRF_LOG_INFO("Test complete! Time passed: %i, ~%i kbps", diff, kbps);
             }
         }
 
-        idle_state_handle();
+        while(NRF_LOG_PROCESS());
+        
+        // This code will not work properly if we enter sleep, 
+        // since there is no event or interrupt in place to trigger the data transfer and wake up the device
+        //idle_state_handle();
     }
 }
 
